@@ -1,0 +1,4 @@
+./glad.c
+./main.cpp
+-Iinclude/
+-lglfw 
