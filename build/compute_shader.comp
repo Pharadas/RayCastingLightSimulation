@@ -2,28 +2,50 @@
 
 layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-// ----------------------------------------------------------------------------
-//
-// uniforms
-//
-// ----------------------------------------------------------------------------
-
 layout(rgba32f, binding = 0) uniform image2D imgOutput;
 
-layout (location = 0) uniform float t;                 /** Time */
+layout (location = 0) uniform float t;
 layout (location = 1) uniform vec2 viewportDimensions;
 layout (location = 3) uniform vec3 position;
 layout (location = 4) uniform vec2 rotation;
 
 #define PI 3.141592
 
-#define MAX_REHITS 0
+#define MAX_REHITS 1
 
 const bool USE_BRANCHLESS_DDA = true;
 const int MAX_RAY_STEPS = 200;
 
-#define POLARIZADOR 0
-#define RETARDADOR  1
+#define LIGHT 0
+#define POLARIZADOR 1
+#define RETARDADOR  2
+#define WALL 3
+#define GOAL 4
+#define NONE 5
+
+struct OpticalObject {
+    int type;
+    float value;
+    vec3 alternate_value; // Color in the case of light
+    vec3 pos;
+};
+
+#define NUMBER_OF_OPTICAL_OBJECTS 2
+
+#define LIGHT_OBJECTS OpticalObject[](\
+ OpticalObject(LIGHT, 0, vec3(1, 0.5, 0.5), vec3(0.5, 0.5, 5.5)),\
+ OpticalObject(LIGHT, 0, vec3(0.1, 0.8, 0.1), vec3(0.5, 0.5, 0.5))\
+)
+
+#define OPTICAL_OBJECTS_ARRAY OpticalObject[](\
+ OpticalObject(LIGHT, 0, vec3(1), vec3(0.5, 0.5, 5.5)),\
+ OpticalObject(LIGHT, 0, vec3(1), vec3(0.5, 0.5, 0.5))\
+)
+
+struct OpticalObjectStack {
+  OpticalObject[10] objects_hit;
+  int number_of_objects_hit;
+};
 
 struct RayObject {
   vec3 rayDir;
@@ -36,18 +58,15 @@ struct RayObject {
 
   bvec3 mask;
 
-  float d;
-  vec3 dst;
+  float distance_traveled;
+  vec3 current_real_position;
   vec3 originalDir;
 
   bool endedInHit;
 
   vec4 color;
-};
 
-struct ObjetoOptico {
-    int tipo;
-    float valor;
+  OpticalObjectStack object_stack;
 };
 
 // Hyperboloc functions by toneburst from 
@@ -93,11 +112,11 @@ float sinh(float val)
 #define cx_cos(a) vec2(cos(a.x) * cosh(a.y), -sin(a.x) * sinh(a.y))
 
 vec2 cx_sqrt(vec2 a) {
-    float r = length(a);
-    float rpart = sqrt(0.5*(r+a.x));
-    float ipart = sqrt(0.5*(r-a.x));
-    if (a.y < 0.0) ipart = -ipart;
-    return vec2(rpart,ipart);
+  float r = length(a);
+  float rpart = sqrt(0.5*(r+a.x));
+  float ipart = sqrt(0.5*(r-a.x));
+  if (a.y < 0.0) ipart = -ipart;
+  return vec2(rpart,ipart);
 }
 
 vec2 cx_tan(vec2 a) {return cx_div(cx_sin(a), cx_cos(a)); }
@@ -168,17 +187,29 @@ bool getVoxel(ivec3 c) {
 	return abs(c.x) > 20 || abs(c.y) > 20 || abs(c.z) > 20 || c.xy == ivec2(5, 5); // || c == ivec3(4, 12, 5) || c == ivec3(-4, -1, 9);
 }
 
+// Literally just iterate over the whole every possible object
+OpticalObject getOpticalObject(vec3 pos) {
+  for (int i = 0; i < NUMBER_OF_OPTICAL_OBJECTS; i++) {
+    if (ivec3(OPTICAL_OBJECTS_ARRAY[i].pos) == ivec3(pos)) {
+      return OPTICAL_OBJECTS_ARRAY[i];
+    }
+  }
+
+  return OpticalObject(NONE, 0, vec3(0), vec3(0));
+}
+
 float checker(vec3 p) {
     return step(0.0, sin(PI * p.x + PI/2.0)*sin(PI *p.y + PI/2.0)*sin(PI *p.z + PI/2.0));
 }
 
 vec3 rotate3dZ(vec3 v, float a) {
-    float cosA = cos(a);
-    float sinA = sin(a);
-    return vec3(
-        v.x * cosA - v.y * sinA,
-        v.x * sinA + v.y * cosA,
-        v.z);
+  float cosA = cos(a);
+  float sinA = sin(a);
+  return vec3(
+    v.x * cosA - v.y * sinA,
+    v.x * sinA + v.y * cosA,
+    v.z
+  );
 }
 
 vec3 rotate3D(vec3 v, vec2 rotation) {
@@ -239,151 +270,64 @@ void step_ray(inout RayObject ray) {
   ray.mapPos += ivec3(vec3(ray.mask)) * ray.rayStep;
 }
 
-bool travel_to_point(inout RayObject ray) {
-	for (int i = 0; i < MAX_RAY_STEPS; i++) {
+void append_to_object_stack(inout OpticalObjectStack object_stack, OpticalObject object) {
+  if (object_stack.number_of_objects_hit < 10) {
+    object_stack.objects_hit[object_stack.number_of_objects_hit] = object;
+    object_stack.number_of_objects_hit++;
+  }
+}
+
+// Steps the ray object until it hits an object
+// WILL MODIFY THE RAY OBJECT
+OpticalObject travel_to_point(inout RayObject ray, bool should_stop_at_goal, vec3 goal) {
+  for (int i = 0; i < MAX_RAY_STEPS; i++) {
     step_ray(ray);
-    if (getVoxel(ray.mapPos)) {
-			ray.d = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
-			ray.dst = ray.rayPos + ray.rayDir * ray.d; 
 
-			// float t = 0.5 + 0.5 * checker(dst);
-			// float t = .2 + checker(ray.dst);
-			// ray.color *= vec4(t, t, t, 1);
-			// vec4 attenuation_value = vec4(1 / pow(float(hits), 10));
-			vec4 attenuation_value = vec4(1);
+    OpticalObject object_hit = getOpticalObject(ray.mapPos);
 
-			if (ray.mask.x) {
-				// ray.color *= vec4(1.) - (vec4(0.8, 0.1, 0.1, 1.0) * attenuation_value);
-				ray.color *= (vec4(0.8, 0.1, 0.1, 1.0) * attenuation_value);
-			}
+    if (should_stop_at_goal && ivec3(ray.mapPos) == ivec3(goal)) {
+        return OpticalObject(GOAL, 0, vec3(0), goal);
+    }
 
-			if (ray.mask.y) {
-				ray.color *= (vec4(0.1, 0.1, 0.8, 1.0) * attenuation_value);
-			}
+    if (object_hit.type == LIGHT) {
+      return object_hit;
+    }
 
-			if (ray.mask.z) {
-				ray.color *= (vec4(0.1, 0.8, 0.1, 1.) * attenuation_value);
-			}
+    if (object_hit.type != NONE) {
+        append_to_object_stack(ray.object_stack, object_hit);
+    }
+
+    if (getVoxel(ray.mapPos) && i != 0) {
+      ray.distance_traveled = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
+      ray.current_real_position = ray.rayPos + ray.rayDir * ray.distance_traveled;
+
+      // float t = 0.5 + 0.5 * checker(dst);
+      float h = .2 + checker(ray.current_real_position);
+      ray.color *= vec4(h, h, h, 1);
+
+      // vec4 attenuation_value = vec4(1 / pow(float(hits), 10));
+      vec4 attenuation_value = vec4(1);
+
+      if (ray.mask.x) {
+          ray.color *= (vec4(0.8, 0.1, 0.1, 1.0) * attenuation_value);
+      }
+
+      if (ray.mask.y) {
+          ray.color *= (vec4(0.1, 0.1, 0.8, 1.0) * attenuation_value);
+      }
+
+      if (ray.mask.z) {
+          ray.color *= (vec4(0.1, 0.8, 0.1, 1.) * attenuation_value);
+      }
 
       // ray.rayDir = reflect(ray.rayDir, vec3(ray.mask));
       // setup_ray_direction(ray);
 
-      return false;
-    } else if (ray.mapPos == ivec3(0, 0, 0)) {
-      return true;
+      return OpticalObject(WALL, 0, vec3(0, 0, 0), ray.current_real_position);
     }
   }
 
-		// 	// checamos si esta expuesto a la luz
-		// 	int m = 0;
-		// 	float w0 = 0.1;
-		//
-		// 	vec3 newRayPos = dst;
-		// 	vec3 newRayDir = normalize(lightPosition - newRayPos);
-		//
-		// 	vec3 newDeltaDist = abs(vec3(length(newRayDir)) / newRayDir);
-		// 	ivec3 newRayStep = ivec3(sign(newRayDir));
-		// 	vec3 newSideDist = (sign(newRayDir) * (vec3(mapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
-		// 	bvec3 newMask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy)); 
-		// 	ivec3 newMapPos = mapPos;
-		// 	vec3 newDst = dst;
-		//
-  //     int contadorDeObjetosOpticosEncontrados = 0;
-  //     ObjetoOptico[] objetosOpticosEncontrados = {
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //         {0, 0.0},
-  //     };
-		//
-		// 	float newD = d;
-		//
-		// 	if (dot(mapPos - lightPosition, vec3(mask) * -rayStep) < 0) {
-		// 		ray.color *= vec4(0.05);
-		// 		break;
-		// 	}
-		//
-		// 	for (int r = 0; r < MAX_RAY_STEPS; r++) {
-		// 		// newMask = lessThanEqual(newSideDist.xyz, min(newSideDist.yzx, newSideDist.zxy));
-		// 		//
-		// 		// newSideDist += vec3(newMask) * newDeltaDist;
-		// 		// newMapPos += ivec3(vec3(newMask)) * newRayStep;
-		// 		//
-		// 		// newD = length(vec3(newMask) * (newSideDist - newDeltaDist));
-		// 		// newDst = newRayPos + newRayDir * newD; 
-		// 		//
-		// 		// newSideDist = (sign(newRayDir) * (vec3(newMapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
-		// 		//
-		// 		// if (newMapPos == ivec3(-1000, -1000, -1000)) { // chocamos con un polarizador
-  //   //       // voy a usar la posicion del polarizador para crear su angulo, solo para poder ver
-  //   //       // el efecto de varios sobre un mismo haz
-  //   //       objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(POLARIZADOR, PI / (newMapPos.y - 3));
-  //   //       contadorDeObjetosOpticosEncontrados++;
-		// 		//
-		// 		// } else if (newMapPos == ivec3(0, 0, 3)) {
-  //   //       objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(RETARDADOR, PI / 4);
-  //   //       contadorDeObjetosOpticosEncontrados++;
-		// 		//
-  //   //     } else if (newMapPos == ivec3(lightPosition)) {
-  //   //       for (int indiceDeObjetoOpticoEncontrado = contadorDeObjetosOpticosEncontrados - 1; indiceDeObjetoOpticoEncontrado >= 0; indiceDeObjetoOpticoEncontrado--) {
-  //   //         if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == POLARIZADOR) {
-  //   //           color *= pow(cos(anguloActualDePolarizacion - objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor), 2);
-  //   //           anguloActualDePolarizacion = objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor;
-		// 		//
-  //   //         } else if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == RETARDADOR) {
-  //   //             // implementacion
-  //   //         }
-  //   //     }
-		// 		//
-  //   //     // float intensityx = computeDistance(lightPosition, position, newDst);
-  //   //     // float intensityy = computeDistance(lightPosition, lightPosition + rotate3D(lightPosition - position, vec2(PI / 2, PI / 2)), newDst);
-		// 		//
-  //   //     // float intensity = intensityx < intensityy ? intensityx : intensityy;
-  //   //     // float intensity = computeDistance(lightPosition, position, newDst);
-  //   //     float intensity = 0.01;
-		// 		//
-  //   //     vec2 result = cx_exp(vec2(0, m * 90));
-  //   //     color *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
-		// 		//
-  //   //     // color *= vec4(1.0, 0.1, 0.1, 1.0);
-  //   //     r = MAX_RAY_STEPS + 1;
-		// 		//
-		// 		// } else if (getVoxel(newMapPos)) {
-		// 		// 	color *= vec4(0.0);
-		// 		// 	r = MAX_RAY_STEPS + 1;
-		// 		// }
-		// 	}
-
-		// mask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
-		//
-		// sideDist += vec3(mask) * deltaDist;
-		// mapPos += ivec3(vec3(mask)) * rayStep;
-		//
-		// d = length(vec3(mask) * (sideDist - deltaDist)); // rayDir normalized
-		// dst = rayPos + rayDir * d; 
-		//
-		// #ifdef BLACK_HOLE
-  //     vec3 newDir = blackHolePosition - dst;
-		//
-  //     float force = - -.1 / pow(length(newDir), 3);
-		//
-  //     if (dot(newDir * force, rayDir) > 0.1) {
-  //       color = vec4(0.);
-  //       break;
-  //     }
-		//
-  //     rayDir = normalize(rayDir + (newDir * force));
-  //   #endif
-
-    // deltaDist = abs(vec3(length(rayDir)) / rayDir);
-    // rayStep = ivec3(sign(rayDir));
-    // sideDist = (sign(rayDir) * (vec3(mapPos) - rayPos) + (sign(rayDir) * 0.5) + 0.5) * deltaDist;
+  return OpticalObject(NONE, 0, vec3(0, 0, 0), ray.current_real_position);
 }
 
 void main() {
@@ -410,7 +354,6 @@ void main() {
 
   int hits = 0;
 
-	// vec3 lightPosition = vec3(0.5, 0.5, 0.5);
   float r = 3.;
 
   float theta_rot = 0;
@@ -437,276 +380,303 @@ void main() {
   d = length(vec3(mask) * (sideDist - deltaDist));
   vec3 dst = rayPos + rayDir * d;
 
-//  RayObject rayo;
-//  rayo.rayDir = rayDir;
-//  rayo.rayPos = rayPos;
-//  rayo.mapPos = mapPos;
-//  rayo.deltaDist = deltaDist;
-//  rayo.rayStep = rayStep;
-//  rayo.sideDist = sideDist;
-//  rayo.mask = mask;
-//  rayo.color = vec4(1.0);
-//  rayo.d = d;
-//  rayo.dst = dst;
+  OpticalObject[10] temp_optical_object_array = {
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0)),
+    OpticalObject(NONE, 0, vec3(0), vec3(0))
+  };
+
+  RayObject ray;
+    ray.object_stack.objects_hit = temp_optical_object_array;
+    ray.object_stack.number_of_objects_hit = 0;
+    ray.rayDir = rayDir;
+    ray.rayPos = rayPos;
+    ray.mapPos = mapPos;
+    ray.deltaDist = deltaDist;
+    ray.rayStep = rayStep;
+    ray.sideDist = sideDist;
+    ray.mask = mask;
+    ray.color = vec4(1.0);
+    ray.distance_traveled = d;
+    ray.current_real_position = dst;
+
+  // Hit any wall from the starting POV
+  // TODO handle NONE return type
+  OpticalObject wall_hit = travel_to_point(ray, false, vec3(0));
+
+  // First check if we are in a side that's visible by the light
+  if (dot(ray.mapPos - LIGHT_OBJECTS[0].pos, vec3(ray.mask) * -ray.rayStep) > 0) {
+    ray.color *= vec4(0.05);
+
+  } else {
+    // Point the ray towards a light and step through;
+    ray.rayPos = ray.current_real_position;
+    ray.rayDir = normalize(LIGHT_OBJECTS[0].pos - ray.rayPos);
+    ray.deltaDist = abs(vec3(length(ray.rayDir)) / ray.rayDir);
+    ray.rayStep = ivec3(sign(ray.rayDir));
+    ray.sideDist = (sign(ray.rayDir) * (vec3(ray.mapPos) - ray.rayPos) + (sign(ray.rayDir) * 0.5) + 0.5) * ray.deltaDist;
+    ray.mask = lessThanEqual(ray.sideDist.xyz, min(ray.sideDist.yzx, ray.sideDist.zxy));
+
+    // Try to reach a light source
+    OpticalObject result = travel_to_point(ray, true, LIGHT_OBJECTS[0].pos);
+
+    // we hit the light source
+    if (result.type == GOAL) {
+      ray.color *= vec4(LIGHT_OBJECTS[0].alternate_value, 1);
+
+      int m = 0;
+      float w0 = 5;
+
+      float intensity = computeDistance(LIGHT_OBJECTS[0].pos, position, ray.current_real_position);
+      float total_phase = cos(1000 * length(LIGHT_OBJECTS[0].pos - ray.current_real_position) + t * 0.5) * 100;
+
+      vec2 result = cx_exp(vec2(0, m * 90));
+      ray.color *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result)) * 10;
+      intensity = cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
+      total_phase *= intensity;
+
+      // color *= (4 * total_intensity[0] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2)) + (4 * total_intensity[1] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2));
+      ray.color *= intensity * abs(total_phase);
+    } else {
+      ray.color *= vec4(0.1);
+    }
+  }
+
+  imageStore(imgOutput, texelCoord, ray.color);
+}
+
+//for (int i = 0; i < MAX_RAY_STEPS; i++) {
+//      if (getVoxel(mapPos) && i != 0) {
+//        hits++;
+//        // lastRayPos = rayPos;
 //
-//  travel_to_point(rayo);
+//        d = length(vec3(mask) * (sideDist - deltaDist)); // rayDir normalized
+//        dst = rayPos + rayDir * d; 
 //
-//  vec4 color_original = rayo.color;
+//        // float t = 0.5 + 0.5 * checker(dst);
+//        float h = .2 + checker(dst);
+//        // float t = .2 + checker(dst);
+//        color *= vec4(h, h, h, 1);
+//        vec4 attenuation_value = vec4(1 / pow(float(hits), 10));
 //
-//  if (dot(rayo.dst - lightPosition, vec3(rayo.mask) * -rayo.rayStep) > 0.) {
-//    rayo.color *= vec4(0.05);
-//  } else {
-//    rayo.rayPos = rayo.dst;
-//    rayo.rayDir = normalize(lightPosition - rayo.rayPos);
-//    setup_ray_direction(rayo);
+//        if (mask.x) {
+//            color *= (vec4(0.8, 0.1, 0.1, 1.0) * attenuation_value);
+//        }
 //
-//    rayo.rayStep = ivec3(sign(rayo.rayDir));
+//        if (mask.y) {
+//            color *= (vec4(0.1, 0.1, 0.8, 1.0) * attenuation_value);
+//        }
 //
-//    if (!travel_to_point(rayo)) {
-//      rayo.color *= vec4(0.05);
+//        if (mask.z) {
+//            color *= (vec4(0.1, 0.8, 0.1, 1.) * attenuation_value);
+//        }
+//
+//        rayDir = reflect(rayDir, vec3(mask));
+//
+//        deltaDist = abs(vec3(length(rayDir)) / rayDir);
+//        rayStep = ivec3(sign(rayDir));
+//        sideDist = (sign(rayDir) * (vec3(mapPos) - rayPos) + (sign(rayDir) * 0.5) + 0.5) * deltaDist;
+//
+//        // checamos si esta expuesto a la luz
+//        int m = 2;
+//        float w0 = 0.1;
+//
+//        float[] total_intensity = {0., 0.};
+//        float[] total_phase = {0., 0.};
+//        vec3[2] dists;
+//
+//        for (int f = 0; f < 2; f++) {
+//          vec4 newColor = vec4(1.);
+//          vec3 lightPosition;
+//
+//          if (f == 0) {
+//            lightPosition = vec3(0.5, 0.5, 0.5);
+//          } else {
+//            lightPosition = vec3(0.5, 0.5, 0.5);
+//          }
+//
+//          vec3 newRayPos = dst;
+//          vec3 newRayDir = normalize(lightPosition - newRayPos);
+//
+//          vec3 newDeltaDist = abs(vec3(length(newRayDir)) / newRayDir);
+//          ivec3 newRayStep = ivec3(sign(newRayDir));
+//          vec3 newSideDist = (sign(newRayDir) * (vec3(mapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
+//          bvec3 newMask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
+//          ivec3 newMapPos = mapPos;
+//          vec3 newDst = dst;
+//
+//          int contadorDeObjetosOpticosEncontrados = 0;
+//          ObjetoOptico[] objetosOpticosEncontrados = {
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//              {0, 0.0},
+//          };
+//
+//    float newD = d;
+//
+//    if (dot(mapPos - lightPosition, vec3(mask) * -rayStep) < 0) {
+//      newColor *= vec4(0.05);
+//      break;
+//    }
+//
+//    vec4 tempColor = vec4(0.);
+//
+//    for (int r = 0; r < MAX_RAY_STEPS; r++) {
+//      newMask = lessThanEqual(newSideDist.xyz, min(newSideDist.yzx, newSideDist.zxy));
+//
+//      newSideDist += vec3(newMask) * newDeltaDist;
+//      newMapPos += ivec3(vec3(newMask)) * newRayStep;
+//
+//      newD = length(vec3(newMask) * (newSideDist - newDeltaDist));
+//      newDst = newRayPos + newRayDir * newD; 
+//
+//      newSideDist = (sign(newRayDir) * (vec3(newMapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
+//
+//      if (newMapPos == ivec3(-1000, -1000, -1000)) { // chocamos con un polarizador
+//        // voy a usar la posicion del polarizador para crear su angulo, solo para poder ver
+//        // el efecto de varios sobre un mismo haz
+//        objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(POLARIZADOR, PI / (newMapPos.y - 3));
+//        contadorDeObjetosOpticosEncontrados++;
+//
+//      } else if (newMapPos == ivec3(0, 0, 3)) {
+//        objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(RETARDADOR, PI / 4);
+//        contadorDeObjetosOpticosEncontrados++;
+//
+//      } else if (newMapPos == ivec3(lightPosition)) {
+//        for (int indiceDeObjetoOpticoEncontrado = contadorDeObjetosOpticosEncontrados - 1; indiceDeObjetoOpticoEncontrado >= 0; indiceDeObjetoOpticoEncontrado--) {
+//        if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == POLARIZADOR) {
+//          newColor *= pow(cos(anguloActualDePolarizacion - objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor), 2);
+//          anguloActualDePolarizacion = objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor;
+//
+//        } else if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == RETARDADOR) {
+//            // implementacion
+//        }
+//      }
+//
+//      // float intensityx = computeDistance(lightPosition, position, newDst);
+//      // float intensityy = computeDistance(lightPosition, lightPosition + rotate3D(lightPosition - position, vec2(PI / 2, PI / 2)), newDst);
+//
+//      // float intensity = intensityx < intensityy ? intensityx : intensityy;
+//
+//      float intensity;
+//      if (f == 0) {
+//        intensity = computeDistance(lightPosition, position, newDst);
+//        total_phase[f] += cos(0.1 * length(lightPosition - newDst) + t * 0.5) * 100;
+//      } else {
+//        intensity = sqrt(pow(lightPosition.x - newDst.x, 2) + pow(lightPosition.y - newDst.y, 2));
+//        total_phase[f] += cos(0.1 * length(lightPosition - newDst)) * 100;
+//      }
+//      // float intensity = 0.01;
+//
+//      vec2 result = cx_exp(vec2(0, m * 90));
+//      newColor *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
+//      total_intensity[f] = cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
+//      total_phase[f] *= total_intensity[f];
+//
+//      dists[f] = abs(dst - lightPosition);
+//
+//      // color *= vec4(1.0, 0.1, 0.1, 1.0);
+//      r = MAX_RAY_STEPS + 1;
+//
+//      } else if (getVoxel(newMapPos)) {
+//        newColor *= vec4(0.5);
+//        r = MAX_RAY_STEPS + 1;
+//      }
 //    }
 //  }
 //
-//  rayo.mask = lessThanEqual(rayo.sideDist.xyz, min(rayo.sideDist.yzx, rayo.sideDist.zxy)); 
-//  step_ray(rayo);
-
-      // if (!travel_to_point(rayo)) {
-      //    rayo.color *= vec4(0.5, 0.5, 0.5, 1.);
-      // }
-
-	for (int i = 0; i < MAX_RAY_STEPS; i++) {
-		if (getVoxel(mapPos) && i != 0) {
-			hits++;
-			// lastRayPos = rayPos;
-
-			d = length(vec3(mask) * (sideDist - deltaDist)); // rayDir normalized
-			dst = rayPos + rayDir * d; 
-
-			// float t = 0.5 + 0.5 * checker(dst);
-            float h = .2 + checker(dst);
-			// float t = .2 + checker(dst);
-			color *= vec4(h, h, h, 1);
-			vec4 attenuation_value = vec4(1 / pow(float(hits), 10));
-
-			if (mask.x) {
-				color *= (vec4(0.8, 0.1, 0.1, 1.0) * attenuation_value);
-			}
-
-			if (mask.y) {
-				color *= (vec4(0.1, 0.1, 0.8, 1.0) * attenuation_value);
-			}
-
-			if (mask.z) {
-				color *= (vec4(0.1, 0.8, 0.1, 1.) * attenuation_value);
-			}
-
-			rayDir = reflect(rayDir, vec3(mask));
-
-			deltaDist = abs(vec3(length(rayDir)) / rayDir);
-			rayStep = ivec3(sign(rayDir));
-			sideDist = (sign(rayDir) * (vec3(mapPos) - rayPos) + (sign(rayDir) * 0.5) + 0.5) * deltaDist;
-
-			// checamos si esta expuesto a la luz
-			int m = 2;
-			float w0 = 0.1;
-
-      float[] total_intensity = {0., 0.};
-      float[] total_phase = {0., 0.};
-      vec3[2] dists;
-
-      for (int f = 0; f < 2; f++) {
-        vec4 newColor = vec4(1.);
-        vec3 lightPosition;
-
-        if (f == 0) {
-          lightPosition = vec3(0.5, 0.5, 0.5);
-        } else {
-          lightPosition = vec3(0.5, 0.5, 0.5);
-        }
-
-        vec3 newRayPos = dst;
-        vec3 newRayDir = normalize(lightPosition - newRayPos);
-
-        vec3 newDeltaDist = abs(vec3(length(newRayDir)) / newRayDir);
-        ivec3 newRayStep = ivec3(sign(newRayDir));
-        vec3 newSideDist = (sign(newRayDir) * (vec3(mapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
-        bvec3 newMask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
-        ivec3 newMapPos = mapPos;
-        vec3 newDst = dst;
-
-        int contadorDeObjetosOpticosEncontrados = 0;
-        ObjetoOptico[] objetosOpticosEncontrados = {
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-            {0, 0.0},
-        };
-
-        float newD = d;
-
-        if (dot(mapPos - lightPosition, vec3(mask) * -rayStep) < 0) {
-          newColor *= vec4(0.05);
-          break;
-        }
-
-        vec4 tempColor = vec4(0.);
-
-        for (int r = 0; r < MAX_RAY_STEPS; r++) {
-          newMask = lessThanEqual(newSideDist.xyz, min(newSideDist.yzx, newSideDist.zxy));
-
-          newSideDist += vec3(newMask) * newDeltaDist;
-          newMapPos += ivec3(vec3(newMask)) * newRayStep;
-
-          newD = length(vec3(newMask) * (newSideDist - newDeltaDist));
-          newDst = newRayPos + newRayDir * newD; 
-
-          newSideDist = (sign(newRayDir) * (vec3(newMapPos) - newRayPos) + (sign(newRayDir) * 0.5) + 0.5) * newDeltaDist;
-
-          if (newMapPos == ivec3(-1000, -1000, -1000)) { // chocamos con un polarizador
-            // voy a usar la posicion del polarizador para crear su angulo, solo para poder ver
-            // el efecto de varios sobre un mismo haz
-            objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(POLARIZADOR, PI / (newMapPos.y - 3));
-            contadorDeObjetosOpticosEncontrados++;
-
-          } else if (newMapPos == ivec3(0, 0, 3)) {
-            objetosOpticosEncontrados[contadorDeObjetosOpticosEncontrados] = ObjetoOptico(RETARDADOR, PI / 4);
-            contadorDeObjetosOpticosEncontrados++;
-
-          } else if (newMapPos == ivec3(lightPosition)) {
-            for (int indiceDeObjetoOpticoEncontrado = contadorDeObjetosOpticosEncontrados - 1; indiceDeObjetoOpticoEncontrado >= 0; indiceDeObjetoOpticoEncontrado--) {
-            if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == POLARIZADOR) {
-              newColor *= pow(cos(anguloActualDePolarizacion - objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor), 2);
-              anguloActualDePolarizacion = objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].valor;
-
-            } else if (objetosOpticosEncontrados[indiceDeObjetoOpticoEncontrado].tipo == RETARDADOR) {
-                // implementacion
-            }
-          }
-
-          // float intensityx = computeDistance(lightPosition, position, newDst);
-          // float intensityy = computeDistance(lightPosition, lightPosition + rotate3D(lightPosition - position, vec2(PI / 2, PI / 2)), newDst);
-
-          // float intensity = intensityx < intensityy ? intensityx : intensityy;
-          float intensity;
-          if (f == 0) {
-            intensity = computeDistance(lightPosition, position, newDst);
-            total_phase[f] += cos(0.1 * length(lightPosition - newDst) + t * 0.5) * 100;
-          } else {
-            intensity = sqrt(pow(lightPosition.x - newDst.x, 2) + pow(lightPosition.y - newDst.y, 2));
-            total_phase[f] += cos(0.1 * length(lightPosition - newDst)) * 100;
-          }
-          // float intensity = 0.01;
-
-          vec2 result = cx_exp(vec2(0, m * 90));
-          newColor *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
-          total_intensity[f] = cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
-          total_phase[f] *= total_intensity[f];
-
-          dists[f] = abs(dst - lightPosition);
-
-          // color *= vec4(1.0, 0.1, 0.1, 1.0);
-          r = MAX_RAY_STEPS + 1;
-
-          } else if (getVoxel(newMapPos)) {
-            newColor *= vec4(0.5);
-            r = MAX_RAY_STEPS + 1;
-          }
-        }
-      }
-
-      // just define how the polarizers will look for now
-      vec2[] polarizationFirst =  {vec2(0.5, 0), vec2(0.5, 0)};
-      vec2[] polarizationSecond = {vec2(0.5, 0), vec2(0.5, 0)};
-
-      float f = 0.5;
-
-      vec2[] polFirst = {
-        cx_mul(cx_exp(cx_mul(vec2(f, 0), vec2(0, -1))), polarizationFirst[0]),
-        cx_mul(cx_exp(cx_mul(vec2(f, 0), vec2(0, -1))), polarizationFirst[1])
-      };
-
-      vec2[] polSecond = {
-        cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(f, 0))), polarizationSecond[0]),
-        cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(f, 0))), polarizationSecond[1])
-      };
-
-      // vec2 resultingPolarizationFirstX = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(dists[0], 0))), vec2(1, 0));
-      // vec2 resultingPolarizationFirstY = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(dists[0], 0))), vec2(1, 0));
-
-      // vec2 resultingPolarizationFirstX = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(w0 * dists[0]))), vec2(1, 0));
-      // vec2 resultingPolarizationSecondX = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(w0 * dists[1]))), vec2(1, 0));
-
-      // vec2 resultingPolarizationFirstY = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(w0 * dists[0]))), vec2(1, 0));
-      // vec2 resultingPolarizationSecondY = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(w0 * dists[1]))), vec2(1, 0));
-
-      color *= (4 * total_intensity[0] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2)) + (4 * total_intensity[1] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2));
-      // color *= (total_intensity[0] * abs(total_phase[0] + total_phase[1])) + (total_intensity[1] * abs(total_phase[1] + total_phase[0]));
-
-      // color *= abs(total_phase[0] + total_phase[1]);
-
-      // color *= total_phase[0] + total_phase[2]
-      // color *= 4 * total_intensity * pow(cos(total_phase / 2), 2);
-
-      // vec2 r = cx_exp(cx_mul(vec2(1, 0), vec2(0, -1)));
-      // if (r + 0.1 > 0.8775825618903728 && r - 0.1 < 0.8775825618903728) {
-        // color = vec4(abs(cx_mul(vec2(f, 0), vec2(0, -1))).y, 0, 0, 1);
-        // color = vec4(0.4 / cx_mul(vec2(f, 0), vec2(0, -1)).x, 0, 0, 1);
-
-        // color *= length(vec2(polFirst[0].x, polFirst[1].x));
-        // color *= float(cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(0.1, 0))), vec2(1, 0)).x);
-
-        // color *= clamp(sqrt(
-        //  pow(polFirst[0].x + polSecond[0].x, 2) +
-        //  pow(polFirst[1].x + polSecond[1].x, 2)
-        //), 0, 1);
-
-        // color *= (length(vec2(cx_add(polFirst[0], polSecond[0]).x, cx_add(polFirst[1], polSecond[1]).x)));
-        // color *= cx_modulus(cx_add(resultingPolarizationFirstX, resultingPolarizationSecondX) + cx_add(resultingPolarizationSecondX, resultingPolarizationSecondY));
-        // color *= cx_modulus(cx_add(resultingPolarizationFirstX, resultingPolarizationSecondX) + cx_add(resultingPolarizationFirstY, resultingPolarizationSecondY));
-
-          if (hits > MAX_REHITS) {
-              // endedInHit = true;
-              break;
-          };
-		}
-
-		mask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
-
-		sideDist += vec3(mask) * deltaDist;
-		mapPos += ivec3(vec3(mask)) * rayStep;
-
-		d = length(vec3(mask) * (sideDist - deltaDist)); // rayDir normalized
-		dst = rayPos + rayDir * d; 
-
-		#ifdef BLACK_HOLE
-			vec3 newDir = blackHolePosition - dst;
-
-			float force = - -.1 / pow(length(newDir), 3);
-
-			if (dot(newDir * force, rayDir) > 0.1) {
-				color = vec4(0.);
-				break;
-			}
-
-			rayDir = normalize(rayDir + (newDir * force));
-		#endif
-
-		deltaDist = abs(vec3(length(rayDir)) / rayDir);
-		rayStep = ivec3(sign(rayDir));
-		sideDist = (sign(rayDir) * (vec3(mapPos) - rayPos) + (sign(rayDir) * 0.5) + 0.5) * deltaDist;
-	}
-
-	// TODO: Primero checar que el lado en el que estemos este expuesto a la luz (algo como if (luz.x > pos.x && mask.x) break;)
-	// if (hits == 0) color = vec4(0.);
-
-	// value.x = mod(float(texelCoord.x) + t * speed, width) / (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
-	// value.y = float(texelCoord.y)/(gl_NumWorkGroups.y*gl_WorkGroupSize.y);
-
-	imageStore(imgOutput, texelCoord, color);
-}
+//  // just define how the polarizers will look for now
+//  vec2[] polarizationFirst =  {vec2(0.5, 0), vec2(0.5, 0)};
+//  vec2[] polarizationSecond = {vec2(0.5, 0), vec2(0.5, 0)};
+//
+//  float f = 0.5;
+//
+//  vec2[] polFirst = {
+//    cx_mul(cx_exp(cx_mul(vec2(f, 0), vec2(0, -1))), polarizationFirst[0]),
+//    cx_mul(cx_exp(cx_mul(vec2(f, 0), vec2(0, -1))), polarizationFirst[1])
+//  };
+//
+//  vec2[] polSecond = {
+//    cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(f, 0))), polarizationSecond[0]),
+//    cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(f, 0))), polarizationSecond[1])
+//  };
+//
+//  // vec2 resultingPolarizationFirstX = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(dists[0], 0))), vec2(1, 0));
+//  // vec2 resultingPolarizationFirstY = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(dists[0], 0))), vec2(1, 0));
+//
+//  // vec2 resultingPolarizationFirstX = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(w0 * dists[0]))), vec2(1, 0));
+//  // vec2 resultingPolarizationSecondX = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(w0 * dists[1]))), vec2(1, 0));
+//
+//  // vec2 resultingPolarizationFirstY = cx_mul(cx_exp(cx_mul(vec2(0, 1), vec2(w0 * dists[0]))), vec2(1, 0));
+//  // vec2 resultingPolarizationSecondY = cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(w0 * dists[1]))), vec2(1, 0));
+//
+//  color *= (4 * total_intensity[0] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2)) + (4 * total_intensity[1] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2));
+//  // color *= (total_intensity[0] * abs(total_phase[0] + total_phase[1])) + (total_intensity[1] * abs(total_phase[1] + total_phase[0]));
+//
+//  // color *= abs(total_phase[0] + total_phase[1]);
+//
+//  // color *= total_phase[0] + total_phase[2]
+//  // color *= 4 * total_intensity * pow(cos(total_phase / 2), 2);
+//
+//  // vec2 r = cx_exp(cx_mul(vec2(1, 0), vec2(0, -1)));
+//  // if (r + 0.1 > 0.8775825618903728 && r - 0.1 < 0.8775825618903728) {
+//    // color = vec4(abs(cx_mul(vec2(f, 0), vec2(0, -1))).y, 0, 0, 1);
+//    // color = vec4(0.4 / cx_mul(vec2(f, 0), vec2(0, -1)).x, 0, 0, 1);
+//
+//    // color *= length(vec2(polFirst[0].x, polFirst[1].x));
+//    // color *= float(cx_mul(cx_exp(cx_mul(vec2(0, -1), vec2(0.1, 0))), vec2(1, 0)).x);
+//
+//    // color *= clamp(sqrt(
+//    //  pow(polFirst[0].x + polSecond[0].x, 2) +
+//    //  pow(polFirst[1].x + polSecond[1].x, 2)
+//    //), 0, 1);
+//
+//    // color *= (length(vec2(cx_add(polFirst[0], polSecond[0]).x, cx_add(polFirst[1], polSecond[1]).x)));
+//    // color *= cx_modulus(cx_add(resultingPolarizationFirstX, resultingPolarizationSecondX) + cx_add(resultingPolarizationSecondX, resultingPolarizationSecondY));
+//    // color *= cx_modulus(cx_add(resultingPolarizationFirstX, resultingPolarizationSecondX) + cx_add(resultingPolarizationFirstY, resultingPolarizationSecondY));
+//
+//      if (hits > MAX_REHITS) {
+//          // endedInHit = true;
+//          break;
+//      };
+//    }
+//
+//    mask = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
+//
+//    sideDist += vec3(mask) * deltaDist;
+//    mapPos += ivec3(vec3(mask)) * rayStep;
+//
+//    d = length(vec3(mask) * (sideDist - deltaDist)); // rayDir normalized
+//    dst = rayPos + rayDir * d; 
+//
+//    #ifdef BLACK_HOLE
+//        vec3 newDir = blackHolePosition - dst;
+//
+//        float force = - -.1 / pow(length(newDir), 3);
+//
+//        if (dot(newDir * force, rayDir) > 0.1) {
+//            color = vec4(0.);
+//            break;
+//        }
+//
+//        rayDir = normalize(rayDir + (newDir * force));
+//    #endif
+//
+//    deltaDist = abs(vec3(length(rayDir)) / rayDir);
+//    rayStep = ivec3(sign(rayDir));
+//    sideDist = (sign(rayDir) * (vec3(mapPos) - rayPos) + (sign(rayDir) * 0.5) + 0.5) * deltaDist;
+//  }
