@@ -30,16 +30,16 @@ struct OpticalObject {
     vec3 pos;
 };
 
-#define NUMBER_OF_OPTICAL_OBJECTS 2
+#define NUMBER_OF_OPTICAL_OBJECTS 1
 
 #define LIGHT_OBJECTS OpticalObject[](\
- OpticalObject(LIGHT, 0, vec3(1, 0.5, 0.5), vec3(0.5, 0.5, 5.5)),\
- OpticalObject(LIGHT, 0, vec3(0.1, 0.8, 0.1), vec3(0.5, 0.5, 0.5))\
+ OpticalObject(LIGHT, 0, vec3(1, 0.5, 0.5), vec3(25.5, 25.5, 25.5)),\
+ OpticalObject(LIGHT, 0, vec3(0.1, 0.8, 0.1), vec3(25.5, 25.5, 25.5))\
 )
 
 #define OPTICAL_OBJECTS_ARRAY OpticalObject[](\
- OpticalObject(LIGHT, 0, vec3(1), vec3(0.5, 0.5, 5.5)),\
- OpticalObject(LIGHT, 0, vec3(1), vec3(0.5, 0.5, 0.5))\
+ OpticalObject(LIGHT, 0, vec3(1), vec3(25.5, 25.5, 25.5)),\
+ OpticalObject(LIGHT, 0, vec3(1), vec3(25.5, 25.5, 25.5))\
 )
 
 struct OpticalObjectStack {
@@ -183,8 +183,10 @@ float computeDistance(vec3 A, vec3 B, vec3 C) {
 }
 
 bool getVoxel(ivec3 c) {
+  int t = 50;
+  return c.x < 1 || c.y < 1 || c.z < 1 || c.x > t || c.y > t || c.z > t;
 	// return abs(c.x) > 20 || abs(c.y) > 20 || abs(c.z) > 20 || c == ivec3(5, 5, 5) || c == ivec3(5, 5, 6) || ((abs(c.x) < 2) && (c.z == 5) && false) || c == ivec3(2, 0, 0) || c == ivec3(-2, 0, 0);
-	return abs(c.x) > 20 || abs(c.y) > 20 || abs(c.z) > 20 || c.xy == ivec2(5, 5); // || c == ivec3(4, 12, 5) || c == ivec3(-4, -1, 9);
+	// return abs(c.x) > 20 || abs(c.y) > 20 || abs(c.z) > 20 || c.xy == ivec2(5, 5); // || c == ivec3(4, 12, 5) || c == ivec3(-4, -1, 9);
 }
 
 // Literally just iterate over the whole every possible object
@@ -210,6 +212,12 @@ vec3 rotate3dZ(vec3 v, float a) {
     v.x * sinA + v.y * cosA,
     v.z
   );
+}
+
+float rayleigh_range(float z, float w0, float wavelength) {
+  float n = 1.0;
+  float Z_r = (PI * w0 * n) / (wavelength);
+  return w0 * sqrt(1 + pow(z / Z_r, 2));
 }
 
 vec3 rotate3D(vec3 v, vec2 rotation) {
@@ -285,25 +293,31 @@ OpticalObject travel_to_point(inout RayObject ray, bool should_stop_at_goal, vec
 
     OpticalObject object_hit = getOpticalObject(ray.mapPos);
 
-    if (should_stop_at_goal && ivec3(ray.mapPos) == ivec3(goal)) {
-        return OpticalObject(GOAL, 0, vec3(0), goal);
-    }
-
-    if (object_hit.type == LIGHT) {
+    if (!should_stop_at_goal && object_hit.type == LIGHT) {
+      ray.distance_traveled = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
+      ray.current_real_position = ray.rayPos + ray.rayDir * ray.distance_traveled;
       return object_hit;
     }
 
-    if (object_hit.type != NONE) {
-        append_to_object_stack(ray.object_stack, object_hit);
+    if (should_stop_at_goal && ivec3(ray.mapPos) == ivec3(goal)) {
+      ray.distance_traveled = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
+      ray.current_real_position = ray.rayPos + ray.rayDir * ray.distance_traveled;
+      return OpticalObject(GOAL, 0, vec3(0), goal);
     }
 
-    if (getVoxel(ray.mapPos) && i != 0) {
+    if (object_hit.type != NONE) {
+      ray.distance_traveled = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
+      ray.current_real_position = ray.rayPos + ray.rayDir * ray.distance_traveled;
+      append_to_object_stack(ray.object_stack, object_hit);
+    }
+
+    if (getVoxel(ray.mapPos)) {
       ray.distance_traveled = length(vec3(ray.mask) * (ray.sideDist - ray.deltaDist));
       ray.current_real_position = ray.rayPos + ray.rayDir * ray.distance_traveled;
 
       // float t = 0.5 + 0.5 * checker(dst);
       float h = .2 + checker(ray.current_real_position);
-      ray.color *= vec4(h, h, h, 1);
+      // ray.color *= vec4(h, h, h, 1);
 
       // vec4 attenuation_value = vec4(1 / pow(float(hits), 10));
       vec4 attenuation_value = vec4(1);
@@ -409,47 +423,129 @@ void main() {
 
   // Hit any wall from the starting POV
   // TODO handle NONE return type
-  OpticalObject wall_hit = travel_to_point(ray, false, vec3(0));
+  OpticalObject object_hit = travel_to_point(ray, false, vec3(0));
+  float[NUMBER_OF_OPTICAL_OBJECTS] total_intensities = {-1};
+  float[NUMBER_OF_OPTICAL_OBJECTS] total_phases = {-1};
+  float[NUMBER_OF_OPTICAL_OBJECTS] total_distances = {-1};
+  bool [NUMBER_OF_OPTICAL_OBJECTS] lights_hit = {false};
 
-  // First check if we are in a side that's visible by the light
-  if (dot(ray.mapPos - LIGHT_OBJECTS[0].pos, vec3(ray.mask) * -ray.rayStep) > 0) {
-    ray.color *= vec4(0.05);
+  if (object_hit.type == LIGHT) {
+    color = vec4(object_hit.alternate_value, 1);
 
   } else {
-    // Point the ray towards a light and step through;
-    ray.rayPos = ray.current_real_position;
-    ray.rayDir = normalize(LIGHT_OBJECTS[0].pos - ray.rayPos);
-    ray.deltaDist = abs(vec3(length(ray.rayDir)) / ray.rayDir);
-    ray.rayStep = ivec3(sign(ray.rayDir));
-    ray.sideDist = (sign(ray.rayDir) * (vec3(ray.mapPos) - ray.rayPos) + (sign(ray.rayDir) * 0.5) + 0.5) * ray.deltaDist;
-    ray.mask = lessThanEqual(ray.sideDist.xyz, min(ray.sideDist.yzx, ray.sideDist.zxy));
+    for (int optical_object_index = 0; optical_object_index < NUMBER_OF_OPTICAL_OBJECTS; optical_object_index++) {
+      // First check if we are in a side that's visible by the light
+      if (dot(ray.mapPos - LIGHT_OBJECTS[optical_object_index].pos, vec3(ray.mask) * -ray.rayStep) > 0) {
+        color *= ray.color * vec4(0.05);
 
-    // Try to reach a light source
-    OpticalObject result = travel_to_point(ray, true, LIGHT_OBJECTS[0].pos);
+      } else {
+        vec3 starting_point = ray.current_real_position;
 
-    // we hit the light source
-    if (result.type == GOAL) {
-      ray.color *= vec4(LIGHT_OBJECTS[0].alternate_value, 1);
+        // Create a new ray to fire to the light
+        RayObject ray_to_light = ray;
+          ray_to_light.rayPos = ray_to_light.current_real_position;
 
-      int m = 0;
-      float w0 = 5;
+          ray_to_light.rayDir = normalize(LIGHT_OBJECTS[optical_object_index].pos - ray_to_light.rayPos);
 
-      float intensity = computeDistance(LIGHT_OBJECTS[0].pos, position, ray.current_real_position);
-      float total_phase = cos(1000 * length(LIGHT_OBJECTS[0].pos - ray.current_real_position) + t * 0.5) * 100;
+          ray_to_light.deltaDist = abs(vec3(length(ray_to_light.rayDir)) / ray_to_light.rayDir);
+          ray_to_light.rayStep = ivec3(sign(ray_to_light.rayDir));
+          ray_to_light.sideDist = (sign(ray_to_light.rayDir) * (vec3(ray_to_light.mapPos) - ray_to_light.rayPos) + (sign(ray_to_light.rayDir) * 0.5) + 0.5) * ray_to_light.deltaDist;
+          ray_to_light.mask = lessThanEqual(ray_to_light.sideDist.xyz, min(ray_to_light.sideDist.yzx, ray_to_light.sideDist.zxy));
 
-      vec2 result = cx_exp(vec2(0, m * 90));
-      ray.color *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result)) * 10;
-      intensity = cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
-      total_phase *= intensity;
+        // Try to reach a light source
+        OpticalObject result = travel_to_point(ray_to_light, true, LIGHT_OBJECTS[optical_object_index].pos);
 
-      // color *= (4 * total_intensity[0] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2)) + (4 * total_intensity[1] * pow(cos(abs(total_phase[0] - total_phase[1]) / 2), 2));
-      ray.color *= intensity * abs(total_phase);
-    } else {
-      ray.color *= vec4(0.1);
+        // we hit the light source
+        if (result.type == GOAL) {
+          color *= ray.color * vec4(LIGHT_OBJECTS[optical_object_index].alternate_value, 1);
+
+          int m = 2;
+          float w0 = 5;
+          float intensity;
+          float initial_intensity = 10;
+          float f = 5;
+          float radius;
+          float phase;
+          float distance_from_real_light_center = 5;
+
+          // we dont want to simulate a perfectly spherical light because those are boring
+          // we will simulate a beam pointing to us, so the distances in the wall will be slightly
+          // different and it won't seem like the phase is just a smear on the wall
+          vec3 beam_pos = (normalize(position - LIGHT_OBJECTS[optical_object_index].pos) * distance_from_real_light_center) + LIGHT_OBJECTS[optical_object_index].pos;
+          float z = length(beam_pos - starting_point);
+
+          if (optical_object_index == 0) {
+            z = length(LIGHT_OBJECTS[optical_object_index].pos - starting_point);
+
+            radius = computeDistance(LIGHT_OBJECTS[optical_object_index].pos, vec3(15.5, 25.5, 25.5), starting_point);
+            phase = pow(cos(f * z), 1);
+            // radius = sqrt(pow(LIGHT_OBJECTS[optical_object_index].pos.x - starting_point.x, 2) + pow(LIGHT_OBJECTS[optical_object_index].pos.y - starting_point.x, 2));
+            // phase = pow(cos(f * z + t), 1);
+            // phase = PI / 2;
+
+          } else {
+            w0 = 1;
+            radius = computeDistance(LIGHT_OBJECTS[optical_object_index].pos, position, starting_point);
+            // radius = computeDistance(LIGHT_OBJECTS[optical_object_index].pos, vec3(15.5, 25.5, 25.5), starting_point);
+
+            phase = pow(cos(f * z), 1);
+            // phase = pow(cos(f * length(LIGHT_OBJECTS[optical_object_index].pos - ray_to_light.current_real_position) + t), 1);
+            // phase = PI;
+          }
+
+          vec2 result = cx_exp(vec2(0, m * 90));
+          float w_z = rayleigh_range(z, w0, 1);
+          intensity = initial_intensity * exp((-2 * pow(radius, 2)) / pow(w_z, 2));
+
+          // intensity = initial_intensity * pow(w0 / w_z, 2) * exp(-(2 * pow(radius, 2)) / pow(w_z, 2));
+          // ray_to_light.color *= vec4(1.0, 0.1, 0.1, 1.0) * cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result)) * 10;
+          // intensity = cx_abs(cx_mul(vec2(pow(intensity / w0, m) * exp(-pow(intensity, 2) / pow(w0, 2)), 0), result));
+          // phase *= intensity;
+
+          total_intensities[optical_object_index] = intensity;
+          total_phases[optical_object_index] = phase;
+          total_distances[optical_object_index] = z;
+
+          // color *= ray_to_light.color * intensity;
+
+        } else if (result.type == LIGHT) {
+          color = vec4(result.alternate_value, 1);
+
+        } else {
+
+          // the ray couldnt hit the light
+          color *= ray_to_light.color * vec4(0.1);
+        }
+      }
     }
   }
 
-  imageStore(imgOutput, texelCoord, ray.color);
+  float final_color_intensity = 0;
+
+  for (int i = 0; i < NUMBER_OF_OPTICAL_OBJECTS; i++) {
+    // final_color_intensity += total_intensities[i];
+    // color *= 
+    // color *= (4 * total_intensities[0] * pow(cos(abs(total_phases[0] - total_phases[1]) / 2), 2)) + (4 * total_intensities[1] * pow(cos(abs(total_phases[0] - total_phases[1]) / 2), 2));
+  }
+
+  // color *= total_intensities[0] + total_intensities[1];
+
+  // if (total_intensities[0] > 0.1 && total_intensities[1] > 0.1)
+  // color *= 2 * (total_intensities[0] + total_intensities[1]) * pow(cos(10 * (total_distances[1] - total_distances[0]) / 2), 2);
+  // color *= 2 * (total_intensities[0] + total_intensities[1]) * pow(cos(10 * (total_distances[1] - total_distances[0]) / 2), 2);
+
+
+  // else
+    //color *= total_intensities[0] + total_intensities[1];
+
+  // color *= (total_intensities[0] * pow(cos(abs(total_phases[0] - total_phases[1]) / 2), 2)) + (total_intensities[1] * pow(cos(abs(total_phases[0] - total_phases[1]) / 2), 2));
+  // color *= (total_intensities[0] * total_phases[0]) + (total_intensities[1] * total_phases[1]);
+
+  color *= total_intensities[0];
+
+  // color *= final_color_intensity;
+
+  imageStore(imgOutput, texelCoord, color);
 }
 
 //for (int i = 0; i < MAX_RAY_STEPS; i++) {
