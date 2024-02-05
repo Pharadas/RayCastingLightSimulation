@@ -23,10 +23,10 @@ const unsigned int SCR_WIDTH = 800;
 const unsigned int SCR_HEIGHT = 600;
 
 // texture size
-const unsigned int TEXTURE_WIDTH = 200, TEXTURE_HEIGHT = 200;
+const unsigned int TEXTURE_WIDTH = 150, TEXTURE_HEIGHT = 150;
 
 // camera
-Camera camera(glm::vec3(5.0f, 5.0f, 5.0f));
+Camera camera(glm::vec3(25.0f, 25.0f, 25.0f));
 float lastX = SCR_WIDTH / 2.0f;
 float lastY = SCR_HEIGHT / 2.0f;
 bool firstMouse = true;
