@@ -6,3 +6,17 @@ And the final intensity by the following equation: $$I(r,z)={|E(r,z)|^{2} \over 
 It is designed to be able to add multiple 'optical objects' such as polarizers or retarders, since it treats the phase of the wave as a complex value.
 
 https://github.com/Pharadas/RayCastingLightSimulation/assets/60682906/4b609ae8-0ece-4158-bb85-1a92796b9b99
+
+Phase polarizers, retarders and rotators and modelled as jones matrices, the following video is a demonstration of two gaussian beams with the following polarizations:
+```math
+\mathbf {E_A}=\begin{bmatrix}1\\0\end{bmatrix}, \mathbf {E_B}=\begin{bmatrix}-1\\0\end{bmatrix}
+```
+
+However, one passes through a phase rotator of PI degrees, described with the following jones matrix:
+```math
+\mathbf {R}=\begin{bmatrix}cos(\pi) & -sin(\pi)\\sin(\pi) & cos(\pi)\end{bmatrix}
+```
+
+https://github.com/Pharadas/RayCastingLightSimulation/assets/60682906/9ba8dcb3-33a2-43d4-9464-6f1f53babb28
+
+As expected, we only see constructive interference on the rays that passed through the rotator, everywhere else we see destructive interference.
